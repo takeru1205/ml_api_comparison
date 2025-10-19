@@ -1,23 +1,27 @@
 [package]
-name = "rapi"
+name = "ml-infer-server"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
 
 [dependencies]
-axum = "0.7"
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-once_cell = "1.19"
-thiserror = "1.0"
+axum = { version = "0.7", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-anyhow = "1.0"
-async-trait = "0.1"
+once_cell = "1"
+anyhow = "1"
+ndarray = { version = "0.16.1", default-features = true, features = ["std", "serde"] }
+tract-onnx = { version = "0.21", default-features = false }
+num_cpus = "1"
+serde_with = "3"
 
-# ===== switched from ort to tract =====
-tract-onnx = "0.22"
-tract-core = "0.22"
 
-# ndarray は tract-onnx が re-export しますが、明示依存でもOK
-ndarray = "0.16"
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"

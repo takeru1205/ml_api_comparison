@@ -1,131 +1,92 @@
+use std::{net::SocketAddr, sync::Arc};
+
+
+use axum::{routing::{get, post}, Json, Router};
+use tracing::{error, info};
+
+
 mod model;
-mod onnx_backend;
-mod preprocess; // 既存ファイルがあっても未使用でも可（必要に応じて整理）
+mod preprocess;
 
-use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
-};
-use model::{DynModel, InputData, PredictResp};
-use onnx_backend::OnnxBackend;
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::net::TcpListener;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Clone)]
-struct AppState {
-    torch: DynModel,
-    lgb: DynModel,
-    torch_onnx: DynModel,
-    lgb_onnx: DynModel,
-}
+use model::{InferModel, ModelPool, ModelType};
+use preprocess::{InputData, Preprocessor};
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // logging
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "axum=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+tracing_subscriber::fmt()
+.with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+.with_target(false)
+.compact()
+.init();
 
-    // === env config ===
-    let models_root = env::var("MODELS_ROOT").unwrap_or_else(|_| "../models".into());
-    let pp_path = env::var("PREPROCESSOR_JSON")
-        .unwrap_or_else(|_| format!("{}/mlp_torch_preprocess.json", models_root));
-    let torch_onnx_path =
-        env::var("TORCH_ONNX").unwrap_or_else(|_| format!("{}/mlp_torch.onnx", models_root));
-    let lgb_onnx_path =
-        env::var("LGB_ONNX").unwrap_or_else(|_| format!("{}/titanic_lgb.onnx", models_root));
 
-    // === backends（Tract 実装；前処理JSONの“パス”を渡す） ===
-    let torch_backend = Arc::new(OnnxBackend::new(
-        PathBuf::from(&torch_onnx_path),
-        PathBuf::from(&pp_path),
-    )?);
-    let lgb_backend = Arc::new(OnnxBackend::new(
-        PathBuf::from(&lgb_onnx_path),
-        PathBuf::from(&pp_path),
-    )?);
+// モデル/前処理の初期化
+let model_dir = std::env::var("MODEL_DIR").unwrap_or_else(|_| "../models".to_string());
+let torch_onnx = format!("{model_dir}/mlp_torch.onnx");
+let lgb_onnx = format!("{model_dir}/titanic_lgb.onnx");
+let preproc_json = std::env::var("PREPROCESSOR_JSON").unwrap_or_else(|_| format!("{model_dir}/mlp_torch_preprocess.json"));
 
-    let state = AppState {
-        torch: torch_backend.clone(),
-        lgb: lgb_backend.clone(),
-        torch_onnx: torch_backend,
-        lgb_onnx: lgb_backend,
-    };
 
-    // === router (Flask互換ルート) ===
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/predict/torch/", post(predict_torch))
-        .route("/predict/lgb/", post(predict_lgb))
-        .route("/predict/torch_onnx/", post(predict_torch_onnx))
-        .route("/predict/lgb_onnx/", post(predict_lgb_onnx))
-        .with_state(state);
+let preproc = Arc::new(Preprocessor::load_json(&preproc_json).unwrap_or_else(|e| {
+error!(error = %e, path = %preproc_json, "failed to load preprocessor; fallback to identity");
+Preprocessor::identity()
+}));
 
-    // === serve (Axum 0.7) ===
-    let port: u16 = env::var("PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8000);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("listening on http://{addr}");
-    axum::serve(listener, app).await?;
 
-    Ok(())
+// セッションは使い回す（起動時にロード）
+let torch_model = Arc::new(InferModel::new(ModelType::TorchOnnx, &torch_onnx)?);
+let lgb_model = Arc::new(InferModel::new(ModelType::LgbOnnx, &lgb_onnx)?);
+
+
+// 軽量プール（複数同時推論に備え clone で Arc 参照を配布）
+let pool = Arc::new(ModelPool { torch_onnx: torch_model, lgb_onnx: lgb_model, preproc });
+
+
+let app = Router::new()
+.route("/", get(|| async { Json(serde_json::json!({"message": "Hello axum"})) }))
+.route("/predict/torch_onnx/", post(predict_torch_onnx))
+.route("/predict/lgb_onnx/", post(predict_lgb_onnx))
+.with_state(pool.clone());
+
+
+// ポートは PORT があれば尊重
+let port: u16 = std::env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8000);
+let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+info!(%addr, "listening");
+
+
+let server = axum::serve(
+tokio::net::TcpListener::bind(addr).await?,
+app.into_make_service(),
+);
+
+
+// Ctrl+C で優雅に終了
+tokio::select! {
+r = server => { r?; }
+_ = tokio::signal::ctrl_c() => { info!("shutdown"); }
+}
+Ok(())
 }
 
-async fn root() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"message": "Hello axum"}))
-}
-
-async fn predict_impl(model: &DynModel, body: InputData) -> anyhow::Result<PredictResp> {
-    let y = model.predict(&body).await?;
-    Ok(PredictResp { prediction: y })
-}
-
-async fn predict_torch(
-    State(st): State<AppState>,
-    Json(body): Json<InputData>,
-) -> Result<Json<PredictResp>, axum::http::StatusCode> {
-    predict_impl(&st.torch, body)
-        .await
-        .map(Json)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-async fn predict_lgb(
-    State(st): State<AppState>,
-    Json(body): Json<InputData>,
-) -> Result<Json<PredictResp>, axum::http::StatusCode> {
-    predict_impl(&st.lgb, body)
-        .await
-        .map(Json)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-}
 
 async fn predict_torch_onnx(
-    State(st): State<AppState>,
-    Json(body): Json<InputData>,
-) -> Result<Json<PredictResp>, axum::http::StatusCode> {
-    predict_impl(&st.torch_onnx, body)
-        .await
-        .map(Json)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+axum::extract::State(pool): axum::extract::State<Arc<ModelPool>>,
+Json(input): Json<InputData>,
+) -> Json<serde_json::Value> {
+let x = pool.preproc.transform(&input);
+let y = pool.torch_onnx.predict(&x);
+Json(serde_json::json!({"prediction": y}))
 }
+
 
 async fn predict_lgb_onnx(
-    State(st): State<AppState>,
-    Json(body): Json<InputData>,
-) -> Result<Json<PredictResp>, axum::http::StatusCode> {
-    predict_impl(&st.lgb_onnx, body)
-        .await
-        .map(Json)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+axum::extract::State(pool): axum::extract::State<Arc<ModelPool>>,
+Json(input): Json<InputData>,
+) -> Json<serde_json::Value> {
+let x = pool.preproc.transform(&input);
+let y = pool.lgb_onnx.predict(&x);
+Json(serde_json::json!({"prediction": y}))
 }
-

@@ -15,16 +15,17 @@
 ### フレームワーク
 
 - Python
-  - FastAPI
-  - Flask
-- Rust(axum, tokio)
-  - ort(onnx model only)
-  - tract(onnx model only)
+  - [FastAPI](https://fastapi.tiangolo.com/)
+  - [Flask](https://flask.palletsprojects.com/en/stable/)
+- Rust([axum](https://docs.rs/axum/latest/axum/), [tokio](https://docs.rs/tokio/latest/tokio/))
+  - [ort(onnx model only)](https://docs.rs/ort/latest/ort/)
+  - [tract(onnx model only)](https://docs.rs/tract-ffi/latest/tract/)
 
+**RustのコードはClaudeCodeに書いてもらった**
 
 ## タスク
 
-Titanic
+[Titanic](https://www.kaggle.com/competitions/titanic/overview)
 
 学習コードは `notebooks/` にある。
 
@@ -36,6 +37,7 @@ Titanic
 - SibSp(Int)
 - Parch(Int)
 - Fare(Float)
+
 
 ### 前処理
 
